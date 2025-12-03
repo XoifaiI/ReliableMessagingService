@@ -1,5 +1,5 @@
 # ReliableMessagingService
-A wrapper around Roblox's MessagingService that tries toguarantees message delivery using Random Linear Network Coding (RLNC) for erasure correction. Messages are automatically encoded into coded pieces that can deal with packet loss, duplicates, and out-of-order delivery.
+A wrapper around Roblox's MessagingService that tries to guarantee message delivery using Random Linear Network Coding (RLNC) for erasure correction. Messages are automatically encoded into coded pieces that can deal with packet loss, duplicates, and out-of-order delivery.
 
 ## Why ReliableMessagingService?
 
