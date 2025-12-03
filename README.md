@@ -35,7 +35,7 @@ if not Success then
 end
 
 -- Unsubscribe when done
-Connection:Disconnect()
+RMS:Unsubscribe("GameEvents")
 ```
 
 ## Configuration
@@ -125,7 +125,7 @@ local Connection = RMS:SubscribeAsync("PlayerUpdates", function(Data: buffer)
 end)
 
 -- Later...
-Connection:Disconnect()
+RMS:Unsubscribe("PlayerUpdates")
 ```
 
 #### Unsubscribe
