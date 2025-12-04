@@ -135,6 +135,14 @@ RMS:Unsubscribe(Topic: string) -> ()
 
 Unsubscribes from a topic and cleans up all associated callbacks and decoders.
 
+#### Destroy
+
+```lua
+RMS:Destroy() -> ()
+```
+
+Cleans up all connections, threads and tables.
+
 ## MessagingService Limits
 
 ReliableMessagingService is still limited by Roblox's rate limits:
@@ -169,7 +177,7 @@ end
 ```
 
 Common errors:
-- `"Data length is zero"` - Empty buffer provided
+- `"Data is empty"` - Empty buffer sent
 - `"Encoded piece too large"` - Data too large even after compression; reduce size or increase PieceCount
 - MessagingService throttling errors - Hitting rate limits
 
