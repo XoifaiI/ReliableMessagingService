@@ -1,36 +1,25 @@
 --[=[
 	ReliableMessagingService: RLNC-based reliable messaging wrapper
 	
-	Reliable message delivery over MessagingService using Random Linear
-	Network Coding (RLNC) for erasure correction. Messages are encoded into
-	coded pieces that can tolerate packet loss and out-of-order delivery.
+	Reliable message delivery over MessagingService using Random Linear Network
+	Coding (RLNC) for erasure correction.
 	
-	Features:
-		- RLNC encoding for erasure correction
-		- Zstd compression to get the most payload capacity (enabled by default)
-		- Configurable redundancy factor for reliability
-		- Per-message decoders with timeout cleanup
-		- RetryAsync for publish reliability (that actually ends cough cough Kohl)
+	Wire format (20 bytes binary header):
+		[8 bytes: JobId prefix] [4 bytes: Counter] [2 bytes: PieceIndex]
+		[2 bytes: TotalPieces] [2 bytes: PieceByteLen] [1 byte: PieceCount]
+		[1 byte: Flags]
 	
-	Limitations (MessagingService):
-		- Message size: 1kB max
-		- Messages sent: 600 + 240 * players per minute per server
-		- Messages received per topic: (40 + 80 * servers) per minute
-		- Subscriptions: 20 + 8 * players per server
-	
-	Return type: ReliableMessagingService class constructor
+	Return type: ReliableMessagingService module
 	
 	Example usage:
-		local ReliableMessagingService = require(path.to.ReliableMessagingService)
-		local RMS = ReliableMessagingService.New()
+		local RMS = require(path.to.ReliableMessagingService)
+		local Service = RMS.New()
 		
-		-- Subscribe to a topic
-		local Connection = RMS:SubscribeAsync("MyTopic", function(Data: buffer)
+		local Connection = Service:SubscribeAsync("MyTopic", function(Data: buffer)
 			print("Received:", buffer.tostring(Data))
 		end)
 		
-		-- Publish a message
-		local Success, Error = RMS:PublishAsync("MyTopic", buffer.fromstring("Hello!"))
+		local Success, Error = Service:PublishAsync("MyTopic", buffer.fromstring("Hello!"))
 --]=]
 
 --!strict
@@ -38,28 +27,30 @@
 local MessagingService = game:GetService("MessagingService")
 local EncodingService = game:GetService("EncodingService")
 local HttpService = game:GetService("HttpService")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local RLNC = require("@self/RLNC")
 local RetryAsync = require("@self/RetryAsync")
+local ThreadQueue = require("@self/ThreadQueue")
 
 type Encoder = RLNC.Encoder
 type Decoder = RLNC.Decoder
 type RLNCError = RLNC.RLNCError
 type RetryHandler = RetryAsync.Handler
 
+local HEADER_SIZE = 20
 local MESSAGE_SIZE_LIMIT = 900
-local HEADER_SIZE = 49
 local DEFAULT_PIECE_COUNT = 8
-local DEFAULT_REDUNDANCY_FACTOR = 1.5
-local DEFAULT_DECODER_TIMEOUT = 30
-local DEFAULT_MAX_ATTEMPTS = 3
-local DEFAULT_RETRY_CONSTANT = 0.5
-local DEFAULT_RETRY_EXPONENT = 2
-local DEFAULT_COMPRESSION_LEVEL = 3
+local DEFAULT_REDUNDANCY = 1.5
+local DEFAULT_TIMEOUT = 30
+local MAX_PIECE_COUNT = 64
+local MAX_TOTAL_PIECES = 256
+local COMPLETED_CACHE_SIZE = 128
+local MAX_PENDING_PER_TOPIC = 256
+local MAX_DECOMPRESSED_SIZE = 1024 * 1024
 
 type MessageHeader = {
-	MessageId: string,
+	JobId: string,
+	Counter: number,
 	PieceIndex: number,
 	TotalPieces: number,
 	PieceByteLen: number,
@@ -67,280 +58,441 @@ type MessageHeader = {
 	Compressed: boolean,
 }
 
-type CallbackRef = {
+type PendingMessage = {
+	Decoder: Decoder,
+	CreatedAt: number,
+	Compressed: boolean,
+	PieceByteLen: number,
+	PieceCount: number,
+}
+
+type CallbackEntry = {
 	Callback: (Data: buffer) -> (),
 	Active: boolean,
 }
 
-type PendingDecoder = {
-	Decoder: Decoder,
-	CreatedAt: number,
-	TotalPieces: number,
-	Compressed: boolean,
-}
-
-export type ReliableMessagingServiceConfig = {
+export type Config = {
 	PieceCount: number?,
 	RedundancyFactor: number?,
 	DecoderTimeout: number?,
-	MaxAttempts: number?,
-	RetryConstant: number?,
-	RetryExponent: number?,
+	MaxRetries: number?,
+	RetryDelay: number?,
 	EnableCompression: boolean?,
 	CompressionLevel: number?,
 }
 
 export type ReliableMessagingService = {
 	PieceCount: number,
-	RedundancyFactor: number,
-	DecoderTimeout: number,
-	MaxAttempts: number,
-	RetryConstant: number,
-	RetryExponent: number,
+	Redundancy: number,
+	Timeout: number,
+	MaxRetries: number,
+	RetryDelay: number,
 	EnableCompression: boolean,
 	CompressionLevel: number,
-	PendingDecoders: { [string]: { [string]: PendingDecoder } },
-	Callbacks: { [string]: { CallbackRef } },
-	Connections: { [string]: RBXScriptConnection },
+	JobId: string,
+	Counter: number,
 	Random: Random,
-	PublishAsync: (self: ReliableMessagingService, Topic: string, Data: buffer, OptionalRetryHandler: RetryHandler?) -> (boolean, string?),
+	Pending: { [string]: { [string]: PendingMessage } },
+	Completed: { [string]: { [string]: number } },
+	CompletedOrder: { [string]: { string } },
+	Queues: { [string]: { [string]: ThreadQueue.ThreadQueue } },
+	Callbacks: { [string]: { CallbackEntry } },
+	Connections: { [string]: RBXScriptConnection },
+	Destroyed: boolean,
+	PublishAsync: (self: ReliableMessagingService, Topic: string, Data: buffer, OptionalHandler: RetryHandler?) -> (boolean, string?),
 	SubscribeAsync: (self: ReliableMessagingService, Topic: string, Callback: (Data: buffer) -> ()) -> RBXScriptConnection,
 	Unsubscribe: (self: ReliableMessagingService, Topic: string) -> (),
-	CleanupExpiredDecoders: (self: ReliableMessagingService) -> (),
+	Destroy: (self: ReliableMessagingService) -> (),
 }
 
-local function SerializeHeader(Header: MessageHeader): string
-	return string.format(
-		"%s|%d|%d|%d|%d|%d",
-		Header.MessageId,
-		Header.PieceIndex,
-		Header.TotalPieces,
-		Header.PieceByteLen,
-		Header.PieceCount,
-		Header.Compressed and 1 or 0
-	)
+local function MessageIdToKey(JobId: string, Counter: number): string
+	return JobId .. "-" .. tostring(Counter)
 end
 
-local function DeserializeHeader(HeaderString: string): MessageHeader?
-	local Parts = string.split(HeaderString, "|")
-	if #Parts ~= 6 then
-		return nil
+local function PackMessage(Header: MessageHeader, CodedPiece: buffer): string
+	local PieceLen = buffer.len(CodedPiece)
+	local Buf = buffer.create(HEADER_SIZE + PieceLen)
+
+	buffer.writestring(Buf, 0, string.sub(Header.JobId, 1, 8))
+	buffer.writeu32(Buf, 8, Header.Counter)
+	buffer.writeu16(Buf, 12, Header.PieceIndex)
+	buffer.writeu16(Buf, 14, Header.TotalPieces)
+	buffer.writeu16(Buf, 16, Header.PieceByteLen)
+	buffer.writeu8(Buf, 18, Header.PieceCount)
+	buffer.writeu8(Buf, 19, Header.Compressed and 1 or 0)
+	buffer.copy(Buf, HEADER_SIZE, CodedPiece, 0, PieceLen)
+
+	return buffer.tostring(EncodingService:Base64Encode(Buf))
+end
+
+local function UnpackMessage(Encoded: string): (MessageHeader?, buffer?)
+	local Success, Buf = pcall(function()
+		return EncodingService:Base64Decode(buffer.fromstring(Encoded))
+	end)
+
+	if not Success or buffer.len(Buf) < HEADER_SIZE then
+		return nil, nil
 	end
 
-	local PieceIndex = tonumber(Parts[2])
-	local TotalPieces = tonumber(Parts[3])
-	local PieceByteLen = tonumber(Parts[4])
-	local PieceCount = tonumber(Parts[5])
-	local CompressedFlag = tonumber(Parts[6])
+	local PieceCount = buffer.readu8(Buf, 18)
+	local PieceByteLen = buffer.readu16(Buf, 16)
+	local ExpectedLen = HEADER_SIZE + PieceCount + PieceByteLen
 
-	if not PieceIndex or not TotalPieces or not PieceByteLen or not PieceCount or not CompressedFlag then
-		return nil
+	if buffer.len(Buf) ~= ExpectedLen then
+		return nil, nil
 	end
 
-	return {
-		MessageId = Parts[1],
-		PieceIndex = PieceIndex,
-		TotalPieces = TotalPieces,
+	if PieceCount == 0 or PieceCount > MAX_PIECE_COUNT then
+		return nil, nil
+	end
+
+	local Header: MessageHeader = {
+		JobId = buffer.readstring(Buf, 0, 8),
+		Counter = buffer.readu32(Buf, 8),
+		PieceIndex = buffer.readu16(Buf, 12),
+		TotalPieces = buffer.readu16(Buf, 14),
 		PieceByteLen = PieceByteLen,
 		PieceCount = PieceCount,
-		Compressed = CompressedFlag == 1,
+		Compressed = buffer.readu8(Buf, 19) == 1,
 	}
-end
 
-local function EncodePayload(Payload: buffer): string
-	local Encoded = EncodingService:Base64Encode(Payload)
-	return buffer.tostring(Encoded)
-end
+	if Header.TotalPieces == 0 or Header.TotalPieces > MAX_TOTAL_PIECES then
+		return nil, nil
+	end
 
-local function DecodePayload(Encoded: string): buffer
-	return EncodingService:Base64Decode(buffer.fromstring(Encoded))
-end
+	if Header.PieceIndex == 0 or Header.PieceIndex > Header.TotalPieces then
+		return nil, nil
+	end
 
-local function GenerateMessageId(): string
-	return HttpService:GenerateGUID(false)
+	local CodedPiece = buffer.create(PieceCount + PieceByteLen)
+	buffer.copy(CodedPiece, 0, Buf, HEADER_SIZE, PieceCount + PieceByteLen)
+
+	return Header, CodedPiece
 end
 
 local ReliableMessagingService = {}
 ReliableMessagingService.__index = ReliableMessagingService
 
-function ReliableMessagingService.New(Config: ReliableMessagingServiceConfig?): ReliableMessagingService
+function ReliableMessagingService.New(Config: Config?): ReliableMessagingService
+	local JobId = game.JobId
+	if JobId == "" then
+		JobId = HttpService:GenerateGUID(false)
+	end
+
 	local self = {
-		PieceCount = if Config and Config.PieceCount then Config.PieceCount else DEFAULT_PIECE_COUNT,
-		RedundancyFactor = if Config and Config.RedundancyFactor then Config.RedundancyFactor else DEFAULT_REDUNDANCY_FACTOR,
-		DecoderTimeout = if Config and Config.DecoderTimeout then Config.DecoderTimeout else DEFAULT_DECODER_TIMEOUT,
-		MaxAttempts = if Config and Config.MaxAttempts then Config.MaxAttempts else DEFAULT_MAX_ATTEMPTS,
-		RetryConstant = if Config and Config.RetryConstant then Config.RetryConstant else DEFAULT_RETRY_CONSTANT,
-		RetryExponent = if Config and Config.RetryExponent then Config.RetryExponent else DEFAULT_RETRY_EXPONENT,
+		PieceCount = Config and Config.PieceCount or DEFAULT_PIECE_COUNT,
+		Redundancy = Config and Config.RedundancyFactor or DEFAULT_REDUNDANCY,
+		Timeout = Config and Config.DecoderTimeout or DEFAULT_TIMEOUT,
+		MaxRetries = Config and Config.MaxRetries or 3,
+		RetryDelay = Config and Config.RetryDelay or 1,
 		EnableCompression = if Config and Config.EnableCompression ~= nil then Config.EnableCompression else true,
-		CompressionLevel = if Config and Config.CompressionLevel then Config.CompressionLevel else DEFAULT_COMPRESSION_LEVEL,
-		PendingDecoders = {},
+		CompressionLevel = Config and Config.CompressionLevel or 3,
+		JobId = JobId,
+		Counter = 0,
+		Random = Random.new(),
+		Pending = {},
+		Completed = {},
+		CompletedOrder = {},
+		Queues = {},
 		Callbacks = {},
 		Connections = {},
-		Random = Random.new(),
+		Destroyed = false,
 	}
 
 	setmetatable(self, ReliableMessagingService)
 
 	task.spawn(function()
-		while true do
-			task.wait(self.DecoderTimeout / 2)
-			self:CleanupExpiredDecoders()
+		while not self.Destroyed do
+			task.wait(self.Timeout / 2)
+			self:CleanupExpired()
 		end
 	end)
 
 	return (self :: any) :: ReliableMessagingService
 end
 
-function ReliableMessagingService:PublishAsync(Topic: string, Data: buffer, OptionalRetryHandler: RetryHandler?): (boolean, string?)
-	local DataLen = buffer.len(Data)
-	if DataLen == 0 then
-		return false, "Data length is zero"
+function ReliableMessagingService.NextMessageId(self : ReliableMessagingService): (string, number)
+	self.Counter += 1
+	if self.Counter > 0xFFFFFFFF then
+		self.Counter = 1
+	end
+	
+	return self.JobId, self.Counter
+end
+
+function ReliableMessagingService:GetQueue(Topic: string, MessageId: string): ThreadQueue.ThreadQueue?
+	local TopicQueues = self.Queues[Topic]
+	if not TopicQueues then
+		TopicQueues = {}
+		self.Queues[Topic] = TopicQueues
 	end
 
-	local DataToEncode = Data
+	local Queue = TopicQueues[MessageId]
+	if not Queue then
+		local QueueCount = 0
+		for _ in TopicQueues :: { [string]: ThreadQueue.ThreadQueue } do
+			QueueCount += 1
+		end
+		
+		if QueueCount >= MAX_PENDING_PER_TOPIC then
+			return nil
+		end
+
+		Queue = ThreadQueue.New()
+		TopicQueues[MessageId] = Queue
+	end
+
+	return Queue
+end
+
+function ReliableMessagingService:CleanupQueue(Topic: string, MessageId: string)
+	local TopicQueues = self.Queues[Topic]
+	if TopicQueues then
+		local Queue = TopicQueues[MessageId]
+		if Queue and Queue:GetLength() == 0 then
+			TopicQueues[MessageId] = nil
+		end
+	end
+end
+
+function ReliableMessagingService:MarkCompleted(Topic: string, MessageId: string)
+	local TopicCompleted = self.Completed[Topic]
+	if not TopicCompleted then
+		TopicCompleted = {}
+		self.Completed[Topic] = TopicCompleted
+	end
+
+	local TopicOrder = self.CompletedOrder[Topic]
+	if not TopicOrder then
+		TopicOrder = {}
+		self.CompletedOrder[Topic] = TopicOrder
+	end
+
+	TopicCompleted[MessageId] = os.clock()
+	table.insert(TopicOrder, MessageId)
+
+	while #TopicOrder > COMPLETED_CACHE_SIZE do
+		local Old = table.remove(TopicOrder, 1)
+		if Old then
+			TopicCompleted[Old] = nil
+		end
+	end
+end
+
+function ReliableMessagingService:IsCompleted(Topic: string, MessageId: string): boolean
+	local TopicCompleted = self.Completed[Topic]
+	return TopicCompleted and TopicCompleted[MessageId] ~= nil
+end
+
+function ReliableMessagingService:CleanupExpired()
+	local Now = os.clock()
+	local TimeoutValue = self.Timeout
+
+	for Topic, TopicPending in self.Pending :: { [string]: { [string]: PendingMessage } } do
+		for MessageId, PendingEntry in TopicPending :: { [string]: PendingMessage } do
+			if Now - PendingEntry.CreatedAt > TimeoutValue then
+				TopicPending[MessageId] = nil
+			end
+		end
+	end
+
+	for Topic, TopicQueues in self.Queues :: { [string]: { [string]: ThreadQueue.ThreadQueue } } do
+		for MessageId, Queue in TopicQueues :: { [string]: ThreadQueue.ThreadQueue } do
+			if Queue:GetLength() == 0 then
+				TopicQueues[MessageId] = nil
+			end
+		end
+	end
+end
+
+function ReliableMessagingService:PublishAsync(Topic: string, Data: buffer, OptionalHandler: RetryHandler?): (boolean, string?)
+	local DataLen = buffer.len(Data)
+	if DataLen == 0 then
+		return false, "Data is empty"
+	end
+
+	local ToEncode = Data
 	local IsCompressed = false
 
 	if self.EnableCompression then
-		local Compressed = EncodingService:CompressBuffer(Data, Enum.CompressionAlgorithm.Zstd, self.CompressionLevel)
-		if buffer.len(Compressed) < DataLen then
-			DataToEncode = Compressed
+		local Success, Compressed = pcall(function()
+			return EncodingService:CompressBuffer(Data, Enum.CompressionAlgorithm.Zstd, self.CompressionLevel)
+		end)
+		
+		if Success and buffer.len(Compressed) < DataLen then
+			ToEncode = Compressed
 			IsCompressed = true
 		end
 	end
 
-	local Encoder, EncoderError = RLNC.Encoder.New(DataToEncode, self.PieceCount)
-	if EncoderError then
-		return false, RLNC.Error.Message(EncoderError :: RLNCError)
+	local PieceCountValue = self.PieceCount
+	local EncoderResult, EncErr = RLNC.Encoder.New(ToEncode, PieceCountValue)
+	if EncErr then
+		return false, RLNC.Error.Message(EncErr :: RLNCError)
 	end
 
-	local EncoderTyped = Encoder :: Encoder
-	local FullCodedPieceByteLen = EncoderTyped:GetFullCodedPieceByteLen()
-	local PieceByteLen = EncoderTyped:GetPieceByteLen()
+	local Enc = EncoderResult :: Encoder
+	local FullPieceLen = Enc:GetFullCodedPieceByteLen()
+	local PieceByteLen = Enc:GetPieceByteLen()
 
-	local Base64PieceLen = math.ceil(FullCodedPieceByteLen * 4 / 3)
-	if Base64PieceLen + HEADER_SIZE > MESSAGE_SIZE_LIMIT then
-		return false, string.format("Encoded piece too large (%d bytes), reduce data size or increase piece count", Base64PieceLen + HEADER_SIZE)
+	local MessageLen = math.ceil((HEADER_SIZE + FullPieceLen) * 4 / 3)
+	if MessageLen > MESSAGE_SIZE_LIMIT then
+		return false, "Message too large, increase piece count or reduce data size"
 	end
 
-	local TotalPiecesToSend = math.ceil(self.PieceCount * self.RedundancyFactor)
-	local MessageId = GenerateMessageId()
+	local TotalPieces = math.min(math.ceil(PieceCountValue * self.Redundancy), MAX_TOTAL_PIECES)
+	local JobId, CounterValue = self:NextMessageId()
 
-	local AllSuccess = true
-	local LastError: string? = nil
+	local CodedBuf = buffer.create(FullPieceLen)
+	local SuccessCount = 0
 
-	for PieceIndex = 1, TotalPiecesToSend do
-		local CodedPiece = EncoderTyped:Code(self.Random)
-		local EncodedPayload = EncodePayload(CodedPiece)
+	for Index = 1, TotalPieces do
+		Enc:CodeWithBuffer(CodedBuf, self.Random)
 
 		local Header: MessageHeader = {
-			MessageId = MessageId,
-			PieceIndex = PieceIndex,
-			TotalPieces = TotalPiecesToSend,
+			JobId = JobId,
+			Counter = CounterValue,
+			PieceIndex = Index,
+			TotalPieces = TotalPieces,
 			PieceByteLen = PieceByteLen,
-			PieceCount = self.PieceCount,
+			PieceCount = PieceCountValue,
 			Compressed = IsCompressed,
 		}
 
-		local MessageContent = SerializeHeader(Header) .. ":" .. EncodedPayload
+		local Message = PackMessage(Header, CodedBuf)
 
-		local Success, Error = RetryAsync(function()
-			MessagingService:PublishAsync(Topic, MessageContent)
-		end, self.MaxAttempts, self.RetryConstant, self.RetryExponent, OptionalRetryHandler)
+		local Ok = RetryAsync(function()
+			MessagingService:PublishAsync(Topic, Message)
+		end, self.MaxRetries, self.RetryDelay, 2, OptionalHandler)
 
-		if not Success then
-			AllSuccess = false
-			LastError = tostring(Error)
+		if Ok then
+			SuccessCount += 1
 		end
 	end
 
-	if AllSuccess then
+	if SuccessCount >= PieceCountValue then
 		return true, nil
-	else
-		return false, LastError
 	end
+	
+	return false, string.format("Only %d/%d pieces sent, need %d", SuccessCount, TotalPieces, PieceCountValue)
 end
 
-function ReliableMessagingService:HandleIncomingMessage(Topic: string, MessageContent: string): ()
-	local SeparatorIndex = string.find(MessageContent, ":")
-	if not SeparatorIndex then
-		return
+function ReliableMessagingService:ProcessPiece(Topic: string, Header: MessageHeader, CodedPiece: buffer): buffer?
+	local MessageId = MessageIdToKey(Header.JobId, Header.Counter)
+
+	if self:IsCompleted(Topic, MessageId) then
+		return nil
 	end
 
-	local HeaderString = string.sub(MessageContent, 1, SeparatorIndex - 1)
-	local PayloadString = string.sub(MessageContent, SeparatorIndex + 1)
-
-	local Header = DeserializeHeader(HeaderString)
-	if not Header then
-		return
+	local TopicPending = self.Pending[Topic]
+	if not TopicPending then
+		TopicPending = {}
+		self.Pending[Topic] = TopicPending
 	end
 
-	local CodedPiece = DecodePayload(PayloadString)
-	local ExpectedLen = Header.PieceCount + Header.PieceByteLen
-	if buffer.len(CodedPiece) ~= ExpectedLen then
-		return
-	end
-
-	local TopicDecoders = self.PendingDecoders[Topic]
-	if not TopicDecoders then
-		TopicDecoders = {}
-		self.PendingDecoders[Topic] = TopicDecoders
-	end
-
-	local PendingDecoderEntry = TopicDecoders[Header.MessageId]
-	if not PendingDecoderEntry then
-		local DecoderInstance, DecoderError = RLNC.Decoder.New(Header.PieceByteLen, Header.PieceCount)
-		if DecoderError then
-			return
+	local PendingEntry = TopicPending[MessageId]
+	if not PendingEntry then
+		local PendingCount = 0
+		for _ in TopicPending :: { [string]: PendingMessage } do
+			PendingCount += 1
+		end
+		
+		if PendingCount >= MAX_PENDING_PER_TOPIC then
+			return nil
 		end
 
-		PendingDecoderEntry = {
-			Decoder = DecoderInstance :: Decoder,
+		local Dec, DecErr = RLNC.Decoder.New(Header.PieceByteLen, Header.PieceCount)
+		if DecErr then
+			return nil
+		end
+
+		PendingEntry = {
+			Decoder = Dec :: Decoder,
 			CreatedAt = os.clock(),
-			TotalPieces = Header.TotalPieces,
 			Compressed = Header.Compressed,
+			PieceByteLen = Header.PieceByteLen,
+			PieceCount = Header.PieceCount,
 		}
-		TopicDecoders[Header.MessageId] = PendingDecoderEntry
+		TopicPending[MessageId] = PendingEntry
 	end
 
-	local DecoderInstance = PendingDecoderEntry.Decoder
-	if DecoderInstance:IsAlreadyDecoded() then
+	if PendingEntry.PieceByteLen ~= Header.PieceByteLen or PendingEntry.PieceCount ~= Header.PieceCount then
+		return nil
+	end
+
+	local Dec = PendingEntry.Decoder
+	if Dec:IsAlreadyDecoded() then
+		return nil
+	end
+
+	local DecErr = Dec:Decode(CodedPiece)
+	if DecErr and DecErr ~= RLNC.Error.PieceNotUseful then
+		return nil
+	end
+
+	if not Dec:IsAlreadyDecoded() then
+		return nil
+	end
+
+	local Decoded, ExtractErr = Dec:GetDecodedData()
+	if ExtractErr or not Decoded then
+		TopicPending[MessageId] = nil
+		return nil
+	end
+
+	TopicPending[MessageId] = nil
+	self:MarkCompleted(Topic, MessageId)
+
+	if PendingEntry.Compressed then
+		local Success, Decompressed = pcall(function()
+			return EncodingService:DecompressBuffer(Decoded :: buffer, Enum.CompressionAlgorithm.Zstd)
+		end)
+		
+		if not Success then
+			return nil
+		end
+		
+		if buffer.len(Decompressed) > MAX_DECOMPRESSED_SIZE then
+			return nil
+		end
+		
+		return Decompressed
+	end
+
+	return Decoded
+end
+
+function ReliableMessagingService:HandleMessage(Topic: string, Content: string)
+	local Header, CodedPiece = UnpackMessage(Content)
+	if not Header or not CodedPiece then
 		return
 	end
 
-	local DecodeError = DecoderInstance:Decode(CodedPiece)
-	if DecodeError and DecodeError ~= RLNC.Error.PieceNotUseful then
+	local MessageId = MessageIdToKey(Header.JobId, Header.Counter)
+	local Queue = self:GetQueue(Topic, MessageId)
+	if not Queue then
 		return
 	end
 
-	if DecoderInstance:IsAlreadyDecoded() then
-		local DecodedData, ExtractError = DecoderInstance:GetDecodedData()
-		if ExtractError or not DecodedData then
-			TopicDecoders[Header.MessageId] = nil
-			return
-		end
+	local Success, Result = Queue:SubmitAsync(function()
+		return self:ProcessPiece(Topic, Header, CodedPiece)
+	end)
 
-		TopicDecoders[Header.MessageId] = nil
+	self:CleanupQueue(Topic, MessageId)
 
-		local FinalData = DecodedData
-		if PendingDecoderEntry.Compressed then
-			local Success, Decompressed = pcall(function()
-				return EncodingService:DecompressBuffer(DecodedData, Enum.CompressionAlgorithm.Zstd)
-			end)
+	if not Success or not Result then
+		return
+	end
 
-			if not Success then
-				return warn("DecompressBuffer failed")
-			end
+	local FinalData = Result :: buffer
+	local TopicCallbacks = self.Callbacks[Topic]
+	if not TopicCallbacks then
+		return
+	end
 
-			FinalData = Decompressed
-		end
-
-		local TopicCallbacks = self.Callbacks[Topic]
-		if TopicCallbacks then
-			for _, CallbackRef in TopicCallbacks do
-				if CallbackRef.Active then
-					task.spawn(CallbackRef.Callback, FinalData)
-				end
-			end
+	for _, Entry in TopicCallbacks :: { CallbackEntry } do
+		if Entry.Active then
+			task.spawn(Entry.Callback, FinalData)
 		end
 	end
 end
@@ -352,87 +504,81 @@ function ReliableMessagingService:SubscribeAsync(Topic: string, Callback: (Data:
 		self.Callbacks[Topic] = TopicCallbacks
 	end
 
-	local CallbackRef = { Callback = Callback, Active = true }
-	table.insert(TopicCallbacks, CallbackRef)
+	local Entry: CallbackEntry = { Callback = Callback, Active = true }
+	table.insert(TopicCallbacks, Entry)
 
-	local ExistingConnection = self.Connections[Topic]
-	if not ExistingConnection then
-		local Connection = MessagingService:SubscribeAsync(Topic, function(Message: { Data: any, Sent: number })
-			local MessageData = Message.Data
-			if typeof(MessageData) ~= "string" then
-				return
+	if not self.Connections[Topic] then
+		local Connection = MessagingService:SubscribeAsync(Topic, function(Message)
+			if typeof(Message.Data) == "string" then
+				self:HandleMessage(Topic, Message.Data)
 			end
-
-			self:HandleIncomingMessage(Topic, MessageData)
 		end)
-
 		self.Connections[Topic] = Connection
 	end
 
-	local ProxyConnection = {
+	local Self = self
+	return {
 		Connected = true,
-		Disconnect = function(ProxySelf: any)
-			if not ProxySelf.Connected then
+		Disconnect = function(Proxy: any)
+			if not Proxy.Connected then
 				return
 			end
+			Proxy.Connected = false
+			Entry.Active = false
 
-			ProxySelf.Connected = false
-			CallbackRef.Active = false
-
-			local CurrentCallbacks = self.Callbacks[Topic]
+			local CurrentCallbacks = Self.Callbacks[Topic] :: { CallbackEntry }?
 			if CurrentCallbacks then
 				for Index = #CurrentCallbacks, 1, -1 do
-					if CurrentCallbacks[Index] == CallbackRef then
+					if CurrentCallbacks[Index] == Entry then
 						table.remove(CurrentCallbacks, Index)
 						break
 					end
 				end
 
 				if #CurrentCallbacks == 0 then
-					local TopicConnection = self.Connections[Topic]
-					if TopicConnection then
-						TopicConnection:Disconnect()
-						self.Connections[Topic] = nil
+					local Conn = Self.Connections[Topic]
+					if Conn then
+						Conn:Disconnect()
+						Self.Connections[Topic] = nil
 					end
-					self.Callbacks[Topic] = nil
-					self.PendingDecoders[Topic] = nil
+					Self.Callbacks[Topic] = nil
+					Self.Pending[Topic] = nil
+					Self.Completed[Topic] = nil
+					Self.CompletedOrder[Topic] = nil
+					Self.Queues[Topic] = nil
 				end
 			end
 		end,
-	}
-
-	return ProxyConnection :: any
+	} :: any
 end
 
-function ReliableMessagingService:Unsubscribe(Topic: string): ()
-	local Connection = self.Connections[Topic]
-	if Connection then
-		Connection:Disconnect()
+function ReliableMessagingService:Unsubscribe(Topic: string)
+	local Conn = self.Connections[Topic]
+	if Conn then
+		Conn:Disconnect()
 		self.Connections[Topic] = nil
 	end
 
 	self.Callbacks[Topic] = nil
-	self.PendingDecoders[Topic] = nil
+	self.Pending[Topic] = nil
+	self.Completed[Topic] = nil
+	self.CompletedOrder[Topic] = nil
+	self.Queues[Topic] = nil
 end
 
-function ReliableMessagingService:CleanupExpiredDecoders(): ()
-	local CurrentTime = os.clock()
-	local Decoders: { [string]: { [string]: PendingDecoder } } = self.PendingDecoders
+function ReliableMessagingService:Destroy()
+	self.Destroyed = true
 
-	for _, TopicDecoders in Decoders do
-		local ToRemove: { string } = {}
-
-		for MessageId, PendingDecoderEntry in TopicDecoders do
-			local Age = CurrentTime - PendingDecoderEntry.CreatedAt
-			if Age > self.DecoderTimeout then
-				table.insert(ToRemove, MessageId)
-			end
-		end
-
-		for _, MessageId in ToRemove do
-			TopicDecoders[MessageId] = nil
-		end
+	for Topic, Conn in self.Connections :: { [string]: RBXScriptConnection } do
+		Conn:Disconnect()
 	end
+
+	table.clear(self.Connections)
+	table.clear(self.Callbacks)
+	table.clear(self.Pending)
+	table.clear(self.Completed)
+	table.clear(self.CompletedOrder)
+	table.clear(self.Queues)
 end
 
 return ReliableMessagingService

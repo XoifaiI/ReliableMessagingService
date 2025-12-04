@@ -46,9 +46,8 @@ local RMS = ReliableMessagingService.New({
     PieceCount = 8,              -- Number of pieces to split data into (default: 8)
     RedundancyFactor = 1.5,      -- Send 50% extra pieces for reliability (default: 1.5)
     DecoderTimeout = 30,         -- Cleanup incomplete decoders after 30s (default: 30)
-    MaxAttempts = 3,             -- Retry failed publishes up to 3 times (default: 3)
-    RetryConstant = 0.5,         -- Base retry delay in seconds (default: 0.5)
-    RetryExponent = 2,           -- Exponential backoff multiplier (default: 2)
+    MaxRetries = 3,              -- Retry failed publishes up to 3 times (default: 3)
+    RetryDelay = 0.5,            -- Base retry delay in seconds (default: 0.5)
     EnableCompression = true,    -- Use Zstd compression (default: true)
     CompressionLevel = 3,        -- Compression level -7-22 (default: 3)
 })
@@ -135,14 +134,6 @@ RMS:Unsubscribe(Topic: string) -> ()
 ```
 
 Unsubscribes from a topic and cleans up all associated callbacks and decoders.
-
-#### CleanupExpiredDecoders
-
-```lua
-RMS:CleanupExpiredDecoders() -> ()
-```
-
-Manually triggers cleanup of expired decoders (automatically called periodically).
 
 ## MessagingService Limits
 
