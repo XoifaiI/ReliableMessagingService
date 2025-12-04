@@ -1,17 +1,17 @@
 # ReliableMessagingService
-A wrapper around Roblox's MessagingService that tries to guarantee message delivery using Random Linear Network Coding (RLNC) for erasure correction. Messages are automatically encoded into coded pieces that can deal with packet loss, duplicates, and out-of-order delivery.
+A wrapper around Roblox's MessagingService that guarantees message delivery using Random Linear Network Coding (RLNC) for erasure correction. Messages are automatically encoded into coded pieces that can handle packet loss, duplicates, and out-of-order delivery.
 
 ## Why ReliableMessagingService?
 
 Roblox's MessagingService provides "best effort" delivery, messages can be dropped, especially under high load or network issues. ReliableMessagingService solves this by:
-- **Erasure Correction**: Uses RLNC to deal with packet loss up to 33-67% depending on configuration
-- **Automatic Compression**: Zstd compression (EncodingService)
+- **Erasure Correction**: Uses RLNC to handle packet loss up to 33-67% depending on configuration
+- **Automatic Compression**: Zstd compression via EncodingService
 - **Smart Retries**: Built in retry logic with exponential backoff for publish operations
 - **Zero Configuration**: Works out of the box with sensible defaults
 - **Order Independence**: Receivers don't need pieces in any particular order
 
 ## Installation
-Copy the ReliableMessagingService module and its dependencies (RLNC, RetryAsync) into your project:
+Copy the ReliableMessagingService module and its dependencies (RLNC, RetryAsync, ThreadQueue) into your project:
 
 ```lua
 local ReliableMessagingService = require(path.to.ReliableMessagingService)
@@ -24,7 +24,7 @@ local ReliableMessagingService = require(path.to.ReliableMessagingService)
 local RMS = ReliableMessagingService.New()
 
 -- Subscribe to a topic
-local Connection = RMS:SubscribeAsync("GameEvents", function(Data: buffer)
+local Success, Connection = RMS:SubscribeAsync("GameEvents", function(Data: buffer)
     print("Received:", buffer.tostring(Data))
 end)
 
@@ -34,8 +34,11 @@ if not Success then
     warn("Failed to publish:", Error)
 end
 
--- Unsubscribe when done
-RMS:Unsubscribe("GameEvents")
+-- Disconnect when done
+Connection:Disconnect()
+
+-- Clean up the service
+RMS:Destroy()
 ```
 
 ## Configuration
@@ -47,9 +50,9 @@ local RMS = ReliableMessagingService.New({
     RedundancyFactor = 1.5,      -- Send 50% extra pieces for reliability (default: 1.5)
     DecoderTimeout = 30,         -- Cleanup incomplete decoders after 30s (default: 30)
     MaxRetries = 3,              -- Retry failed publishes up to 3 times (default: 3)
-    RetryDelay = 0.5,            -- Base retry delay in seconds (default: 0.5)
+    RetryDelay = 1,              -- Base retry delay in seconds (default: 1)
     EnableCompression = true,    -- Use Zstd compression (default: true)
-    CompressionLevel = 3,        -- Compression level -7-22 (default: 3)
+    CompressionLevel = 3,        -- Compression level -7 to 22 (default: 3)
 })
 ```
 
@@ -71,7 +74,7 @@ Higher redundancy = more reliability, but more bandwidth and rate limit usage.
 ### Constructor
 
 ```lua
-ReliableMessagingService.New(Config: ReliableMessagingServiceConfig?) -> ReliableMessagingService
+ReliableMessagingService.New(Config: Config?) -> ReliableMessagingService
 ```
 
 Creates a new instance with optional configuration.
@@ -99,6 +102,9 @@ Publishes a reliable message to a topic. Returns `(true, nil)` on success or `(f
 ```lua
 local Message = buffer.fromstring("Important data")
 local Success, Error = RMS:PublishAsync("CriticalEvents", Message)
+if not Success then
+    warn("Failed to publish:", Error)
+end
 ```
 
 #### SubscribeAsync
@@ -107,10 +113,10 @@ local Success, Error = RMS:PublishAsync("CriticalEvents", Message)
 RMS:SubscribeAsync(
     Topic: string,
     Callback: (Data: buffer) -> ()
-) -> RBXScriptConnection
+) -> (boolean, RBXScriptConnection?)
 ```
 
-Subscribes to reliable messages on a topic. Returns a connection object.
+Subscribes to reliable messages on a topic. Returns `(success, connection)`.
 
 **Parameters:**
 - `Topic`: MessagingService topic name
@@ -118,13 +124,18 @@ Subscribes to reliable messages on a topic. Returns a connection object.
 
 **Example:**
 ```lua
-local Connection = RMS:SubscribeAsync("PlayerUpdates", function(Data: buffer)
+local Success, Connection = RMS:SubscribeAsync("PlayerUpdates", function(Data: buffer)
     local Message = buffer.tostring(Data)
     print("Received update:", Message)
 end)
 
+if not Success then
+    warn("Failed to subscribe")
+    return
+end
+
 -- Later...
-RMS:Unsubscribe("PlayerUpdates")
+Connection:Disconnect()
 ```
 
 #### Unsubscribe
@@ -133,7 +144,7 @@ RMS:Unsubscribe("PlayerUpdates")
 RMS:Unsubscribe(Topic: string) -> ()
 ```
 
-Unsubscribes from a topic and cleans up all associated callbacks and decoders.
+Unsubscribes from a topic and cleans up all associated callbacks and decoders. Note: Individual connections can also call `:Disconnect()` to remove just their callback.
 
 #### Destroy
 
@@ -141,19 +152,20 @@ Unsubscribes from a topic and cleans up all associated callbacks and decoders.
 RMS:Destroy() -> ()
 ```
 
-Cleans up all connections, threads and tables.
+Cleans up all connections, threads, and tables. Call this when the service is no longer needed.
 
 ## MessagingService Limits
 
-ReliableMessagingService is still limited by Roblox's rate limits:
+ReliableMessagingService is still constrained by Roblox's rate limits:
 
 - **Message size**: 1kB max (900 bytes after overhead)
-- **Send rate**: 600 + 240 x players per minute per server
-- **Receive rate**: 40 + 80 x servers per minute per topic
-- **Subscriptions**: 20 + 8 x players per server
+- **Send rate**: 600 + 240 × players per minute per server
+- **Receive rate**: 40 + 80 × servers per minute per topic
+- **Subscriptions**: 20 + 8 × players per server
 
-Each published message sends multiple pieces (e.g., 12 pieces with default settings), so take this into account.
-https://devforum.roblox.com/t/enhanced-messagingservice-limits/2835576
+Each published message sends multiple pieces (e.g., 12 pieces with default settings), so factor this into your rate limit calculations.
+
+[Enhanced MessagingService Limits](https://devforum.roblox.com/t/enhanced-messagingservice-limits/2835576)
 
 ## How It Works
 1. **Publishing**: Data is optionally compressed, then encoded into multiple coded pieces using RLNC
@@ -177,9 +189,11 @@ end
 ```
 
 Common errors:
-- `"Data is empty"` - Empty buffer sent
-- `"Encoded piece too large"` - Data too large even after compression; reduce size or increase PieceCount
-- MessagingService throttling errors - Hitting rate limits
+- `"Data is empty"` -> Empty buffer provided
+- `"Message too large, increase piece count or reduce data size"` -> Data too large even after compression
+- `"Service has been destroyed"` -> Attempted to use a destroyed service
+- `"Only X/Y pieces sent, need Z"` -> Too many pieces failed to send
+- MessagingService throttling errors -> Rate limits exceeded
 
 ## Performance Tips
 1. **Choose appropriate PieceCount**: Larger messages need more pieces to stay under the 900-byte limit per piece
@@ -187,6 +201,37 @@ Common errors:
 3. **Enable compression**: Enabled by default, can dramatically reduce message size
 4. **Batch updates**: Combine multiple small updates into one message when possible
 5. **Monitor decoder timeouts**: If messages frequently timeout, increase `DecoderTimeout` or `RedundancyFactor`
+6. **Test under load**: Make sure your configuration handles your expected message volume within rate limits
+
+## Advanced Usage
+
+### Multiple Callbacks per Topic
+
+You can have multiple callbacks subscribed to the same topic:
+
+```lua
+local Success1, Conn1 = RMS:SubscribeAsync("Events", function(Data)
+    print("Handler 1:", buffer.tostring(Data))
+end)
+
+local Success2, Conn2 = RMS:SubscribeAsync("Events", function(Data)
+    print("Handler 2:", buffer.tostring(Data))
+end)
+
+-- Both callbacks will receive all messages
+```
+
+### Custom Retry Handlers
+
+Provide custom retry logic:
+
+```lua
+local function MyRetryHandler(AttemptNumber: number, MaxRetries: number)
+    warn(string.format("Retry attempt %d/%d", AttemptNumber, MaxRetries))
+end
+
+RMS:PublishAsync("MyTopic", Data, MyRetryHandler)
+```
 
 ## License
 

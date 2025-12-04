@@ -22,29 +22,28 @@ type QueueEntry = {
 	Callback: () -> any,
 }
 
-export type ThreadQueue = {
+type ThreadQueueData = {
 	Queue: { QueueEntry },
 	Running: boolean,
-	SubmitAsync: (self: ThreadQueue, Callback: () -> any) -> (boolean, any),
-	GetLength: (self: ThreadQueue) -> number,
-	SkipToLastEnqueued: (self: ThreadQueue) -> (),
 }
 
 local ThreadQueue = {}
 ThreadQueue.__index = ThreadQueue
 
+export type ThreadQueue = typeof(setmetatable({} :: ThreadQueueData, ThreadQueue))
+
 function ThreadQueue.New(): ThreadQueue
-	local self = {
+	local self: ThreadQueueData = {
 		Queue = {},
 		Running = false,
 	}
 
 	setmetatable(self, ThreadQueue)
 
-	return (self :: any) :: ThreadQueue
+	return self :: ThreadQueue
 end
 
-function ThreadQueue:SubmitAsync(Callback: () -> any): (boolean, any)
+function ThreadQueue.SubmitAsync(self: ThreadQueue, Callback: () -> any): (boolean, any)
 	local Entry: QueueEntry = {
 		Thread = coroutine.running(),
 		Callback = Callback,
@@ -56,25 +55,22 @@ function ThreadQueue:SubmitAsync(Callback: () -> any): (boolean, any)
 	return coroutine.yield()
 end
 
-function ThreadQueue:GetLength(): number
-		local Length = 0
-		for Index, Value in self.Queue do
-			Length += 1
-		end
+function ThreadQueue.GetLength(self: ThreadQueue): number
+	return #self.Queue
+end
 
-		return Length
-	end
+function ThreadQueue.SkipToLastEnqueued(self: ThreadQueue): ()
+	local QueueRef = self.Queue
+	local Length = #QueueRef
 
-function ThreadQueue:SkipToLastEnqueued()
-	local QueueRef: { QueueEntry } = self.Queue
-
-	if self:GetLength() > 1 then
-		local Last = QueueRef[#QueueRef]
-		self.Queue = { Last }
+	if Length > 1 then
+		local Last = QueueRef[Length]
+		table.clear(QueueRef)
+		QueueRef[1] = Last
 	end
 end
 
-function ThreadQueue:StartQueue()
+function ThreadQueue.StartQueue(self: ThreadQueue): ()
 	if self.Running then
 		return
 	end
@@ -82,15 +78,15 @@ function ThreadQueue:StartQueue()
 	self.Running = true
 
 	task.defer(function()
-		while self:GetLength() > 0 do
+		while #self.Queue > 0 do
 			self:PopQueue()
 		end
-		
+
 		self.Running = false
 	end)
 end
 
-function ThreadQueue:PopQueue()
+function ThreadQueue.PopQueue(self: ThreadQueue): ()
 	local Entry = table.remove(self.Queue, 1)
 	if not Entry then
 		return
