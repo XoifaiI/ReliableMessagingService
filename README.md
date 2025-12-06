@@ -11,7 +11,7 @@ Roblox's MessagingService provides "best effort" delivery, messages can be dropp
 - **Order Independence**: Receivers don't need pieces in any particular order
 
 ## Installation
-Copy the ReliableMessagingService module and its dependencies (RLNC, RetryAsync, ThreadQueue) into your project:
+Copy the ReliableMessagingService module and its dependencies (RLNC, RetryAsync) into your project:
 
 ```lua
 local ReliableMessagingService = require(path.to.ReliableMessagingService)
@@ -20,26 +20,31 @@ local ReliableMessagingService = require(path.to.ReliableMessagingService)
 ## Quick Start
 
 ```lua
-local Start = 0
 local ReliableMessagingService = require(game.ReplicatedStorage.ReliableMessagingService)
 local RMS = ReliableMessagingService.New()
 
--- Subscribe to a topic
-local Connection = RMS:SubscribeAsync("GameEvents", function(Data: buffer)
-	print("Received:", buffer.tostring(Data), os.clock() - Start)
-end)
+local function Handler1(Data: buffer)
+	print("Received:", buffer.tostring(Data))
+end
 
+local function Handler2(Data: buffer)
+	warn("Also received:", buffer.tostring(Data))
+end
+
+-- Subscribe with multiple callbacks
+RMS:SubscribeAsync("GameEvents", Handler1, Handler2)
+
+-- Publish a message
 local Success, Error = RMS:PublishAsync("GameEvents", buffer.fromstring("Hello, World!"))
 if not Success then
 	warn("Failed to publish:", Error)
-else
-	Start = os.clock()
 end
 
-if Connection then
-	-- Disconnect when done
-	Connection:Disconnect()
-end
+-- Remove specific callback
+RMS:Unsubscribe("GameEvents", Handler1)
+
+-- Remove all callbacks for topic
+RMS:Unsubscribe("GameEvents")
 
 -- Clean up the service
 RMS:Destroy()
@@ -52,7 +57,7 @@ Customize behavior with optional configuration:
 local RMS = ReliableMessagingService.New({
     PieceCount = 8,              -- Number of pieces to split data into (default: 8)
     RedundancyFactor = 1.5,      -- Send 50% extra pieces for reliability (default: 1.5)
-    DecoderTimeout = 30,         -- Cleanup incomplete decoders after 30s (default: 30)
+    Timeout = 30,                -- Cleanup incomplete decoders after 30s (default: 30)
     MaxRetries = 3,              -- Retry failed publishes up to 3 times (default: 3)
     RetryDelay = 1,              -- Base retry delay in seconds (default: 1)
     EnableCompression = true,    -- Use Zstd compression (default: true)
@@ -71,7 +76,7 @@ The `RedundancyFactor` determines how many extra pieces are sent:
 | 2.0              | 16                | 50%             |
 | 3.0              | 24                | 67%             |
 
-Higher redundancy = more reliability, but more bandwidth and slower receive times.
+Higher redundancy = more reliability, but more bandwidth and slower receive times (typically 1.5-3 seconds with defaults).
 
 ## API Reference
 
@@ -90,8 +95,7 @@ Creates a new instance with optional configuration.
 ```lua
 RMS:PublishAsync(
     Topic: string,
-    Data: buffer,
-    OptionalRetryHandler: RetryHandler?
+    Data: buffer
 ) -> (boolean, string?)
 ```
 
@@ -100,7 +104,6 @@ Publishes a reliable message to a topic. Returns `(true, nil)` on success or `(f
 **Parameters:**
 - `Topic`: MessagingService topic name
 - `Data`: Buffer containing your message data
-- `OptionalRetryHandler`: Custom retry callback (optional)
 
 **Example:**
 ```lua
@@ -116,39 +119,55 @@ end
 ```lua
 RMS:SubscribeAsync(
     Topic: string,
-    Callback: (Data: buffer) -> ()
-) -> RBXScriptConnection?
+    ...: (Data: buffer) -> ()
+) -> boolean
 ```
 
-Subscribes to reliable messages on a topic. Returns `(connection)` on success or `(nil)` on failure.
+Subscribes one or more callbacks to reliable messages on a topic. Returns `true` on success or `false` on failure. All callbacks will receive every message published to the topic.
 
 **Parameters:**
 - `Topic`: MessagingService topic name
-- `Callback`: Function called when a complete message is decoded
+- `...`: One or more callback functions
 
 **Example:**
 ```lua
-local Connection = RMS:SubscribeAsync("PlayerUpdates", function(Data: buffer)
-    local Message = buffer.tostring(Data)
-    print("Received update:", Message)
-end)
-
-if not Connection then
-    warn("Failed to subscribe")
-    return
+local function OnMessage(Data: buffer)
+    print("Received:", buffer.tostring(Data))
 end
 
--- Later...
-Connection:Disconnect()
+local function OnMessageLog(Data: buffer)
+    -- Log to analytics
+end
+
+local Success = RMS:SubscribeAsync("PlayerUpdates", OnMessage, OnMessageLog)
+if not Success then
+    warn("Failed to subscribe")
+end
 ```
 
 #### Unsubscribe
 
 ```lua
-RMS:Unsubscribe(Topic: string) -> ()
+RMS:Unsubscribe(
+    Topic: string,
+    ...: (Data: buffer) -> ()?
+) -> ()
 ```
 
-Unsubscribes from a topic and cleans up all associated callbacks and decoders. Note: Individual connections can also call `:Disconnect()` to remove just their callback.
+Unsubscribes from a topic. If no callbacks are provided, removes all callbacks and disconnects from MessagingService. If specific callbacks are provided, only those callbacks are removed (MessagingService connection stays alive if other callbacks remain).
+
+**Parameters:**
+- `Topic`: MessagingService topic name
+- `...`: Optional specific callback functions to remove
+
+**Examples:**
+```lua
+-- Remove specific callbacks
+RMS:Unsubscribe("GameEvents", Handler1, Handler2)
+
+-- Remove all callbacks for topic
+RMS:Unsubscribe("GameEvents")
+```
 
 #### Destroy
 
@@ -176,7 +195,7 @@ Each published message sends multiple pieces (e.g., 12 pieces with default setti
 2. **Transmission**: Each piece is sent separately with a header containing metadata
 3. **Reception**: Pieces arrive in any order, and duplicates are ignored
 4. **Decoding**: Once enough linearly independent pieces arrive, the original data is reconstructed
-5. **Delivery**: Your callback receives the decoded buffer
+5. **Delivery**: All subscribed callbacks receive the decoded buffer
 
 The receiver only needs to successfully receive `PieceCount` valid pieces out of the total sent, regardless of which specific pieces arrive or their order.
 
@@ -194,9 +213,10 @@ end
 
 Common errors:
 - `"Data is empty"` -> Empty buffer provided
-- `"Message too large, increase piece count or reduce data size"` -> Data too large even after compression
+- `"Message too large"` -> Data too large even after compression
 - `"Service has been destroyed"` -> Attempted to use a destroyed service
-- `"Only X/Y pieces sent, need Z"` -> Too many pieces failed to send
+- `"Only X/Y pieces sent"` -> Too many pieces failed to send
+- `"Too many active publishes"` -> Hit concurrent publish limit (50)
 - MessagingService throttling errors -> Rate limits exceeded
 
 ## Performance Tips
@@ -204,37 +224,44 @@ Common errors:
 2. **Tune redundancy**: Higher redundancy = better reliability but more bandwidth and slower receive times
 3. **Enable compression**: Enabled by default, can dramatically reduce message size
 4. **Batch updates**: Combine multiple small updates into one message when possible
-5. **Monitor decoder timeouts**: If messages frequently timeout, increase `DecoderTimeout` or `RedundancyFactor`
+5. **Monitor decoder timeouts**: If messages timeout, increase `Timeout` or `RedundancyFactor`
 6. **Test under load**: Make sure your configuration handles your expected message volume within rate limits
 
 ## Advanced Usage
 
 ### Multiple Callbacks per Topic
 
-You can have multiple callbacks subscribed to the same topic:
+You can subscribe multiple callbacks to the same topic in a single call or across multiple calls:
 
 ```lua
-local Conn1 = RMS:SubscribeAsync("Events", function(Data)
-    print("Handler 1:", buffer.tostring(Data))
-end)
+-- Single call with multiple callbacks
+RMS:SubscribeAsync("Events", Handler1, Handler2, Handler3)
 
-local Conn2 = RMS:SubscribeAsync("Events", function(Data)
-    print("Handler 2:", buffer.tostring(Data))
-end)
+-- Or multiple calls (uses same internal connection)
+RMS:SubscribeAsync("Events", Handler1)
+RMS:SubscribeAsync("Events", Handler2)  -- Reuses existing connection
 
--- Both callbacks will receive all messages
+-- All callbacks receive every message
 ```
 
-### Custom Retry Handlers
+### Selective Unsubscribe
 
-Provide custom retry logic:
+Remove specific callbacks while keeping others active:
 
 ```lua
-local function MyRetryHandler(AttemptNumber: number, MaxRetries: number)
-    warn(string.format("Retry attempt %d/%d", AttemptNumber, MaxRetries))
-end
+local function Handler1(Data) print("H1") end
+local function Handler2(Data) print("H2") end
+local function Handler3(Data) print("H3") end
 
-RMS:PublishAsync("MyTopic", Data, MyRetryHandler)
+RMS:SubscribeAsync("Events", Handler1, Handler2, Handler3)
+
+-- Remove just Handler2
+RMS:Unsubscribe("Events", Handler2)
+-- Handler1 and Handler3 still active
+
+-- Remove multiple specific handlers
+RMS:Unsubscribe("Events", Handler1, Handler3)
+-- All callbacks removed, connection cleaned up automatically
 ```
 
 ## License

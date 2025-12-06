@@ -92,7 +92,7 @@ type ServiceData = {
 	PendingCounts: { [string]: number },
 	Subscribing: { [string]: boolean },
 	SubscribeWaiters: { [string]: { thread } },
-	Callbacks: { [string]: (Data: buffer) -> () },
+	Callbacks: { [string]: { (Data: buffer) -> () } },
 	Connections: { [string]: RBXScriptConnection },
 	CleanupThread: thread?,
 	Destroyed: boolean,
@@ -245,7 +245,8 @@ function ReliableMessagingService.CleanupExpired(self: ReliableMessagingService)
 end
 
 function ReliableMessagingService.ProcessPiece(self: ReliableMessagingService, Topic: string, Header: MessageHeader, CodedPiece: buffer): ()
-	if not self.Callbacks[Topic] then
+	local Callbacks = self.Callbacks[Topic]
+	if not Callbacks or #Callbacks == 0 then
 		return
 	end
 
@@ -322,8 +323,7 @@ function ReliableMessagingService.ProcessPiece(self: ReliableMessagingService, T
 		FinalData = EncodingService:DecompressBuffer(Decoded, Enum.CompressionAlgorithm.Zstd)
 	end
 
-	local Callback = self.Callbacks[Topic]
-	if Callback then
+	for _, Callback in Callbacks do
 		task.spawn(Callback, FinalData)
 	end
 end
@@ -430,9 +430,28 @@ function ReliableMessagingService.PublishAsync(self: ReliableMessagingService, T
 	return false, string.format("Only %d/%d pieces sent", SuccessCount, TotalPieces)
 end
 
-function ReliableMessagingService.SubscribeAsync(self: ReliableMessagingService, Topic: string, Callback: (Data: buffer) -> ()): RBXScriptConnection?
+function ReliableMessagingService.SubscribeAsync(self: ReliableMessagingService, Topic: string, ...: (Data: buffer) -> ()): boolean
+	if self.Destroyed then
+		return false
+	end
+
+	local NewCallbacks = {...}
+	if #NewCallbacks == 0 then
+		return false
+	end
+
+	local Callbacks = self.Callbacks[Topic]
+	if not Callbacks then
+		Callbacks = {}
+		self.Callbacks[Topic] = Callbacks
+	end
+
+	for _, Callback in NewCallbacks do
+		table.insert(Callbacks, Callback)
+	end
+
 	if self.Connections[Topic] then
-		return self.Connections[Topic]
+		return true
 	end
 
 	if self.Subscribing[Topic] then
@@ -441,19 +460,18 @@ function ReliableMessagingService.SubscribeAsync(self: ReliableMessagingService,
 			Waiters = {}
 			self.SubscribeWaiters[Topic] = Waiters
 		end
-		
+
 		table.insert(Waiters, coroutine.running())
-		
+
 		local Result = coroutine.yield()
 		if self.Destroyed then
-			return nil
+			return false
 		end
-		
-		return Result
+
+		return Result ~= nil
 	end
 
 	self.Subscribing[Topic] = true
-	self.Callbacks[Topic] = Callback
 
 	local Success, Connection = RetryAsync(function()
 		return MessagingService:SubscribeAsync(Topic, function(Message)
@@ -461,7 +479,6 @@ function ReliableMessagingService.SubscribeAsync(self: ReliableMessagingService,
 				self:HandleMessage(Topic, Message.Data)
 			end
 		end)
-		
 	end, self.MaxRetries, self.RetryDelay, 2)
 
 	self.Subscribing[Topic] = nil
@@ -480,20 +497,51 @@ function ReliableMessagingService.SubscribeAsync(self: ReliableMessagingService,
 		self.SubscribeWaiters[Topic] = nil
 	end
 
-	return Connection
+	return Connection ~= nil
 end
 
-function ReliableMessagingService.Unsubscribe(self: ReliableMessagingService, Topic: string): ()
-	local Conn = self.Connections[Topic]
-	if Conn then
-		Conn:Disconnect()
+function ReliableMessagingService.Unsubscribe(self: ReliableMessagingService, Topic: string, ...: (Data: buffer) -> ()): ()
+	local ToRemove = {...}
+
+	if #ToRemove == 0 then
+		local Conn = self.Connections[Topic]
+		if Conn then
+			Conn:Disconnect()
+		end
+
+		self.Connections[Topic] = nil
+		self.Callbacks[Topic] = nil
+		self.Pending[Topic] = nil
+		self.PendingCounts[Topic] = nil
+		self.Subscribing[Topic] = nil
+		return
 	end
 
-	self.Connections[Topic] = nil
-	self.Callbacks[Topic] = nil
-	self.Pending[Topic] = nil
-	self.PendingCounts[Topic] = nil
-	self.Subscribing[Topic] = nil
+	local Callbacks = self.Callbacks[Topic]
+	if not Callbacks then
+		return
+	end
+
+	for _, CallbackToRemove in ToRemove do
+		for i = #Callbacks, 1, -1 do
+			if Callbacks[i] == CallbackToRemove then
+				table.remove(Callbacks, i)
+			end
+		end
+	end
+
+	if #Callbacks == 0 then
+		local Conn = self.Connections[Topic]
+		if Conn then
+			Conn:Disconnect()
+		end
+
+		self.Connections[Topic] = nil
+		self.Callbacks[Topic] = nil
+		self.Pending[Topic] = nil
+		self.PendingCounts[Topic] = nil
+		self.Subscribing[Topic] = nil
+	end
 end
 
 function ReliableMessagingService.Destroy(self: ReliableMessagingService): ()
@@ -522,6 +570,10 @@ function ReliableMessagingService.Destroy(self: ReliableMessagingService): ()
 	table.clear(self.Subscribing)
 
 	table.clear(self.Connections)
+
+	for _, Callbacks in self.Callbacks do
+		table.clear(Callbacks)
+	end
 	table.clear(self.Callbacks)
 
 	table.clear(self.Pending)
