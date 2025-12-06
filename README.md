@@ -6,7 +6,7 @@ A wrapper around Roblox's MessagingService that guarantees message delivery usin
 Roblox's MessagingService provides "best effort" delivery, messages can be dropped, especially under high load or network issues. ReliableMessagingService solves this by:
 - **Erasure Correction**: Uses RLNC to handle packet loss up to 33-67% depending on configuration
 - **Automatic Compression**: Zstd compression via EncodingService
-- **Smart Retries**: Built in retry logic with exponential backoff for publish operations
+- **Smart Retries**: Built in retry logic with exponential backoff for publish and subscribe methods
 - **Zero Configuration**: Works out of the box with sensible defaults
 - **Order Independence**: Receivers don't need pieces in any particular order
 
@@ -20,22 +20,26 @@ local ReliableMessagingService = require(path.to.ReliableMessagingService)
 ## Quick Start
 
 ```lua
-local ReliableMessagingService = require(path.to.ReliableMessagingService)
+local Start = 0
+local ReliableMessagingService = require(game.ReplicatedStorage.ReliableMessagingService)
 local RMS = ReliableMessagingService.New()
 
 -- Subscribe to a topic
-local Success, Connection = RMS:SubscribeAsync("GameEvents", function(Data: buffer)
-    print("Received:", buffer.tostring(Data))
+local Connection = RMS:SubscribeAsync("GameEvents", function(Data: buffer)
+	print("Received:", buffer.tostring(Data), os.clock() - Start)
 end)
 
--- Publish a message
 local Success, Error = RMS:PublishAsync("GameEvents", buffer.fromstring("Hello, World!"))
 if not Success then
-    warn("Failed to publish:", Error)
+	warn("Failed to publish:", Error)
+else
+	Start = os.clock()
 end
 
--- Disconnect when done
-Connection:Disconnect()
+if Connection then
+	-- Disconnect when done
+	Connection:Disconnect()
+end
 
 -- Clean up the service
 RMS:Destroy()
@@ -67,7 +71,7 @@ The `RedundancyFactor` determines how many extra pieces are sent:
 | 2.0              | 16                | 50%             |
 | 3.0              | 24                | 67%             |
 
-Higher redundancy = more reliability, but more bandwidth and rate limit usage.
+Higher redundancy = more reliability, but more bandwidth and slower receive times.
 
 ## API Reference
 
@@ -113,10 +117,10 @@ end
 RMS:SubscribeAsync(
     Topic: string,
     Callback: (Data: buffer) -> ()
-) -> (boolean, RBXScriptConnection?)
+) -> RBXScriptConnection?
 ```
 
-Subscribes to reliable messages on a topic. Returns `(success, connection)`.
+Subscribes to reliable messages on a topic. Returns `(connection)` on success or `(nil)` on failure.
 
 **Parameters:**
 - `Topic`: MessagingService topic name
@@ -124,12 +128,12 @@ Subscribes to reliable messages on a topic. Returns `(success, connection)`.
 
 **Example:**
 ```lua
-local Success, Connection = RMS:SubscribeAsync("PlayerUpdates", function(Data: buffer)
+local Connection = RMS:SubscribeAsync("PlayerUpdates", function(Data: buffer)
     local Message = buffer.tostring(Data)
     print("Received update:", Message)
 end)
 
-if not Success then
+if not Connection then
     warn("Failed to subscribe")
     return
 end
@@ -197,7 +201,7 @@ Common errors:
 
 ## Performance Tips
 1. **Choose appropriate PieceCount**: Larger messages need more pieces to stay under the 900-byte limit per piece
-2. **Tune redundancy**: Higher redundancy = better reliability but more bandwidth
+2. **Tune redundancy**: Higher redundancy = better reliability but more bandwidth and slower receive times
 3. **Enable compression**: Enabled by default, can dramatically reduce message size
 4. **Batch updates**: Combine multiple small updates into one message when possible
 5. **Monitor decoder timeouts**: If messages frequently timeout, increase `DecoderTimeout` or `RedundancyFactor`
@@ -210,11 +214,11 @@ Common errors:
 You can have multiple callbacks subscribed to the same topic:
 
 ```lua
-local Success1, Conn1 = RMS:SubscribeAsync("Events", function(Data)
+local Conn1 = RMS:SubscribeAsync("Events", function(Data)
     print("Handler 1:", buffer.tostring(Data))
 end)
 
-local Success2, Conn2 = RMS:SubscribeAsync("Events", function(Data)
+local Conn2 = RMS:SubscribeAsync("Events", function(Data)
     print("Handler 2:", buffer.tostring(Data))
 end)
 
